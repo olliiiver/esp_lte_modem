@@ -376,6 +376,8 @@ err:
     return ESP_FAIL;
 }
 
+
+
 /**
  * @brief Get Operator's name
  *
@@ -414,6 +416,63 @@ static esp_err_t bg96_deinit(modem_dce_t *dce)
     return ESP_OK;
 }
 
+/**
+ * @brief Handle response from AT+CPIN=XXXX
+ */
+static esp_err_t bg96_handle_pin(modem_dce_t *dce, const char *line)
+{
+    esp_err_t err = ESP_FAIL;
+    if (strstr(line, MODEM_RESULT_CODE_SUCCESS)) {
+        err = esp_modem_process_command_done(dce, MODEM_STATE_SUCCESS);
+    } 
+    return err;
+}
+
+/**
+ * @brief Handle response from AT+CPIN?
+ */
+static esp_err_t bg96_handle_ask_pin(modem_dce_t *dce, const char *line)
+{
+    esp_err_t err = ESP_OK;
+    ESP_LOGI(DCE_TAG, "PIN ASK response: %s", line);
+    if (!strncmp(line, "+CPIN: SIM PIN", strlen("+CPIN: SIM PIN"))) {
+        ESP_LOGI(DCE_TAG, "SIM needs PIN");
+        dce->needpin = true;
+    }
+        if (strstr(line, MODEM_RESULT_CODE_SUCCESS)) {
+        err = esp_modem_process_command_done(dce, MODEM_STATE_SUCCESS);
+    } 
+    return err;
+}
+
+/**
+ * @brief Set PIN
+ *
+ * @param bg96_dce bg96 object
+ * @return esp_err_t
+ *      - ESP_OK on success
+ *      - ESP_FAIL on error
+ */
+static esp_err_t bg96_ask_pin(bg96_modem_dce_t *bg96_dce)
+{
+    modem_dte_t *dte = bg96_dce->parent.dte;
+    bg96_dce->parent.handle_line = bg96_handle_ask_pin;
+    DCE_CHECK(dte->send_cmd(dte, "AT+CPIN?\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send CPIN command failed", err);
+    if (bg96_dce->parent.needpin) {
+        ESP_LOGI(DCE_TAG, "submit PIN");
+        bg96_dce->parent.handle_line = bg96_handle_pin;
+        DCE_CHECK(dte->send_cmd(dte, "AT+CPIN=4097\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send CPIN command failed", err);
+        DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "set PIN failed", err);
+        ESP_LOGI(DCE_TAG, "set PIN ok");
+        bg96_dce->parent.needpin = false;
+        return ESP_OK;
+    }
+    DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "set PIN failed", err);
+    return ESP_OK;
+err:
+    return ESP_FAIL;
+}
+
 modem_dce_t *bg96_init(modem_dte_t *dte)
 {
     DCE_CHECK(dte, "DCE should bind with a DTE", err);
@@ -435,6 +494,7 @@ modem_dce_t *bg96_init(modem_dte_t *dte)
     bg96_dce->parent.get_battery_status = bg96_get_battery_status;
     bg96_dce->parent.set_working_mode = bg96_set_working_mode;
     bg96_dce->parent.power_down = bg96_power_down;
+    bg96_dce->parent.needpin = false;
     bg96_dce->parent.deinit = bg96_deinit;
     /* Sync between DTE and DCE */
     DCE_CHECK(esp_modem_dce_sync(&(bg96_dce->parent)) == ESP_OK, "sync failed", err_io);
@@ -442,6 +502,8 @@ modem_dce_t *bg96_init(modem_dte_t *dte)
     DCE_CHECK(esp_modem_dce_echo(&(bg96_dce->parent), false) == ESP_OK, "close echo mode failed", err_io);
     /* Get Module name */
     DCE_CHECK(bg96_get_module_name(bg96_dce) == ESP_OK, "get module name failed", err_io);
+    /* Set PIN */
+    DCE_CHECK(bg96_ask_pin(bg96_dce) == ESP_OK, "set PIN failed", err_io); 
     /* Get IMEI number */
     DCE_CHECK(bg96_get_imei_number(bg96_dce) == ESP_OK, "get imei failed", err_io);
     /* Get IMSI number */
