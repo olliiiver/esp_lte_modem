@@ -1,4 +1,4 @@
-menu "ESP-MODEM"
+menu "ESP-LTE-MODEM"
 
     config COMPONENT_MODEM_APN
         string "Set Access Point Name (APN)"
@@ -6,7 +6,7 @@ menu "ESP-MODEM"
         help
             Logical name which is used to select the GGSN or the external packet data network.
 
-    config COMPONENT_MODEM_APN
+    config COMPONENT_MODEM_PIN
         string "Set Personal identification number (PIN)"
         default ""
         help
