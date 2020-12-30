@@ -86,5 +86,6 @@ modem_dce_t *sim7600_init(modem_dte_t *dte)
 {
     modem_dce_t *dce = bg96_init(dte);
     dte->dce->get_battery_status = sim7600_get_battery_status;
+    dte->dce->setup_cmux = esp_modem_dce_setup_cmux;
     return dce;
 }

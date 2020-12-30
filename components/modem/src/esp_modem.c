@@ -21,6 +21,7 @@
 #include "esp_log.h"
 #include "sdkconfig.h"
 
+#define ESP_MODEM_LINE_BUFFER_SIZE (CONFIG_UART_RX_BUFFER_SIZE / 2)
 #define ESP_MODEM_EVENT_QUEUE_SIZE (16)
 
 #define MIN_PATTERN_INTERVAL (9)
@@ -78,6 +79,35 @@ static inline bool is_only_cr_lf(const char *str, uint32_t len)
     return true;
 }
 
+uint8_t crc8(const char *src, size_t len, uint8_t polynomial, uint8_t initial_value,
+	  bool reversed)
+{
+	uint8_t crc = initial_value;
+	size_t i, j;
+
+	for (i = 0; i < len; i++) {
+		crc ^= src[i];
+
+		for (j = 0; j < 8; j++) {
+			if (reversed) {
+				if (crc & 0x01) {
+					crc = (crc >> 1) ^ polynomial;
+				} else {
+					crc >>= 1;
+				}
+			} else {
+				if (crc & 0x80) {
+					crc = (crc << 1) ^ polynomial;
+				} else {
+					crc <<= 1;
+				}
+			}
+		}
+	}
+
+	return crc;
+}
+
 esp_err_t esp_modem_set_rx_cb(modem_dte_t *dte, esp_modem_on_receive receive_cb, void *receive_cb_ctx)
 {
     esp_modem_dte_t *esp_dte = __containerof(dte, esp_modem_dte_t, parent);
@@ -116,6 +146,82 @@ err:
 }
 
 /**
+ * @brief Handle one line in DTE
+ *
+ * @param esp_dte ESP modem DTE object
+ * @return esp_err_t
+ *      - ESP_OK on success
+ *      - ESP_FAIL on error
+ */
+static esp_err_t esp_dte_handle_cmux_frame(esp_modem_dte_t *esp_dte, int32_t buf_length)
+{
+    modem_dce_t *dce = esp_dte->parent.dce;
+    MODEM_CHECK(dce, "DTE has not yet bind with DCE", err);
+    char *frame = (char *)(esp_dte->buffer);
+    if (buf_length < 5) {
+        ESP_LOGD(MODEM_TAG, "Buffer too small. Buf: %d", buf_length);
+        buf_length += uart_read_bytes(esp_dte->uart_port, (uint8_t *)&frame[buf_length], 6 - buf_length, pdMS_TO_TICKS(100));
+    }
+    while (buf_length > 5)
+    {
+        uint8_t dlci = frame[1] >> 2;
+        uint8_t type = frame[2];
+        uint8_t length = frame[3] >> 1;
+        ESP_LOGI(MODEM_TAG, "CMUX FR: A:%02x T:%02x L:%d Buf:%d", dlci, type, length, buf_length);
+        while (length + 6 > buf_length)
+        {
+            ESP_LOGD(MODEM_TAG, "Frame length %d, buffer %d, reading additional %d", length, buf_length, length + 6 - buf_length);
+            buf_length += uart_read_bytes(esp_dte->uart_port, (uint8_t *)&frame[buf_length], length + 6 - buf_length, pdMS_TO_TICKS(100));
+            ESP_LOGD(MODEM_TAG, "Final buffer %d", buf_length);
+        }
+        if (dce->handle_cmux_frame != NULL)
+            MODEM_CHECK(dce->handle_cmux_frame(dce, frame) == ESP_OK, "handle cmux frame failed", err_handle);
+        else if (type == 0xFF && dlci == 1 && dce->handle_line != NULL &&
+                 !(dce->mode == MODEM_PPP_MODE) && strlen(&frame[6]) > 2)
+        {
+            // Handle CONNECT message on DLCI 1
+            ESP_LOGI(MODEM_TAG, "Line: %s", &frame[6]);
+            MODEM_CHECK(dce->handle_line, "no handler for line", err_handle);
+            MODEM_CHECK(dce->handle_line(dce, &frame[6]) == ESP_OK, "handle line failed", err_handle);
+        }
+        else if ((type == FT_UIH || type == 0xFF) && dlci == 2 && dce->handle_line != NULL)
+        {
+            ESP_LOGD(MODEM_TAG, "Handle line from DLCI 2");
+            frame[4 + length] = '\0';
+            /* Skipping first two \r\n */
+            if (strlen(&frame[6]) > 2)
+            {
+                ESP_LOGD(MODEM_TAG, "Line: %s", &frame[6]);
+                MODEM_CHECK(dce->handle_line, "no handler for line", err_handle);
+                MODEM_CHECK(dce->handle_line(dce, &frame[6]) == ESP_OK, "handle line failed", err_handle);
+            }
+        }
+        else if ((type == FT_UIH || type == 0xFF) && length && dlci == 1 && esp_dte->receive_cb != NULL)
+        {
+            // Handle DCI 1
+            ESP_LOGD(MODEM_TAG, "Pass data from DLCI: %d to receive_cb", dlci);
+            esp_dte->receive_cb(&frame[4], length, esp_dte->receive_cb_ctx);
+        }
+        else if (dlci != 0)
+        {
+            ESP_LOGW(MODEM_TAG, "Unknown state...");
+        }
+        frame += length + 6;
+        buf_length -= length + 6;
+    }
+
+    return ESP_OK;
+
+err_handle:
+    /* Send ESP_MODEM_EVENT_UNKNOWN signal to event loop */
+    esp_event_post_to(esp_dte->event_loop_hdl, ESP_MODEM_EVENT, ESP_MODEM_EVENT_UNKNOWN,
+                      "cmux frame invalid", 4, pdMS_TO_TICKS(100));
+
+err:
+    return ESP_FAIL;
+}
+
+/**
  * @brief Handle when a pattern has been detected by UART
  *
  * @param esp_dte ESP32 Modem DTE object
@@ -136,6 +242,7 @@ static void esp_handle_uart_pattern(esp_modem_dte_t *esp_dte)
         if (read_len) {
             /* make sure the line is a standard string */
             esp_dte->buffer[read_len] = '\0';
+            ESP_LOGD(MODEM_TAG, "< line: %s", esp_dte->buffer);
             /* Send new line to handle */
             esp_dte_handle_line(esp_dte);
         } else {
@@ -154,19 +261,30 @@ static void esp_handle_uart_pattern(esp_modem_dte_t *esp_dte)
  */
 static void esp_handle_uart_data(esp_modem_dte_t *esp_dte)
 {
-    if (esp_dte->parent.dce->mode != MODEM_PPP_MODE) {
-        ESP_LOGE(MODEM_TAG, "Error: Got data event in PPP mode");
-        /* pattern detection mode -> ignore date event on uart
-         * (should never happen, but if it does, we could still
-         * read the valid data once pattern detect event fired) */
-        return;
-    }
+//    if (esp_dte->parent.dce->mode != MODEM_PPP_MODE
+//    || esp_dte->parent.dce->mode == MODEM_CMUX_MODE
+//    ) {
+//        ESP_LOGE(MODEM_TAG, "Error: Got data event in PPP mode");
+//        /* pattern detection mode -> ignore date event on uart
+//         * (should never happen, but if it does, we could still
+//         * read the valid data once pattern detect event fired) */
+//        return;
+//    }
     size_t length = 0;
     uart_get_buffered_data_len(esp_dte->uart_port, &length);
     length = MIN(esp_dte->line_buffer_size, length);
     length = uart_read_bytes(esp_dte->uart_port, esp_dte->buffer, length, portMAX_DELAY);
     /* pass the input data to configured callback */
     if (length) {
+				// printf("received < ");
+				// for (uint8_t i = 0; i < length; i++)
+				//	printf("%02x ", esp_dte->buffer[i]);
+				// printf("\n");
+        if (esp_dte->buffer[0] == SOF_MARKER)
+        {
+          esp_dte_handle_cmux_frame(esp_dte, length);
+          return;
+        }
         esp_dte->receive_cb(esp_dte->buffer, length, esp_dte->receive_cb_ctx);
     }
 }
@@ -249,6 +367,92 @@ err:
     return ret;
 }
 
+static esp_err_t esp_modem_dte_send_sabm(modem_dte_t *dte, uint8_t dlci, uint32_t timeout)
+{
+  esp_err_t ret = ESP_FAIL;
+  modem_dce_t *dce = dte->dce;
+  MODEM_CHECK(dce, "DTE has not yet bind with DCE", err);
+  esp_modem_dte_t *esp_dte = __containerof(dte, esp_modem_dte_t, parent);
+  char frame[6];
+  frame[0] = SOF_MARKER;
+  frame[1] = (dlci << 2) | 0x3;
+  frame[2] = FT_SABM | PF;
+  frame[3] = 1;
+  frame[4] = 0xFF - crc8(&frame[1], 3, FCS_POLYNOMIAL, FCS_INIT_VALUE, true);
+  frame[5] = SOF_MARKER;
+	/*printf("sabm > ");
+  for (uint8_t i = 0; i < 6; i++)
+    printf("%02x ", frame[i]);
+  printf("\n");*/
+  /* Calculate timeout clock tick */
+  /* Reset runtime information */
+  dce->state = MODEM_STATE_PROCESSING;
+  /* Send command via UART */
+  uart_write_bytes(esp_dte->uart_port, frame, 6);
+  /* Check timeout */
+  MODEM_CHECK(xSemaphoreTake(esp_dte->process_sem, pdMS_TO_TICKS(timeout)) == pdTRUE, "process command timeout", err);
+  ret = ESP_OK;
+err:
+  dce->handle_cmux_frame = NULL;
+  return ret;
+  //f9 03 2f 01 09 f9
+}
+
+/**
+ * @brief Send command to DCE
+ *
+ * @param dte Modem DTE object
+ * @param command command string
+ * @param timeout timeout value, unit: ms
+ * @return esp_err_t
+ *      - ESP_OK on success
+ *      - ESP_FAIL on error
+ */
+static esp_err_t esp_modem_dte_send_cmux_cmd(modem_dte_t *dte, const char *command, uint32_t timeout)
+{
+    esp_err_t ret = ESP_FAIL;
+    modem_dce_t *dce = dte->dce;
+    MODEM_CHECK(dce, "DTE has not yet bind with DCE", err);
+    MODEM_CHECK(command, "command is NULL", err);
+    esp_modem_dte_t *esp_dte = __containerof(dte, esp_modem_dte_t, parent);
+    char *frame;
+		frame = (char *) malloc(6 + strlen(command));
+		if (strcmp(command, "ATD*99***1#\r") == 0)
+		{
+			ESP_LOGI(MODEM_TAG, "Got ATD");
+			frame[1] = (0x1 << 2) + 1;
+		}
+		else
+		{
+			frame[1] = (0x2 << 2) + 1;
+		}
+    frame[0] = SOF_MARKER;
+    frame[2] = FT_UIH;
+    frame[3] = (strlen(command) << 1) + 1;
+    memcpy(&frame[4], command, strlen(command));
+    frame[4 + strlen(command)] = 0xFF - crc8(&frame[1], 3, FCS_POLYNOMIAL, FCS_INIT_VALUE, true);
+    frame[5 + strlen(command)] = SOF_MARKER;
+    ESP_LOGD(MODEM_TAG, "> %s", command);
+    //printf("cmd > ");
+    //for (uint8_t i = 0; i < 6 + strlen(command); i++)
+    //  printf("%02x ", frame[i]);
+    //printf("\n");
+
+    /* Calculate timeout clock tick */
+    /* Reset runtime information */
+    dce->state = MODEM_STATE_PROCESSING;
+    /* Send command via UART */
+    uart_write_bytes(esp_dte->uart_port, frame, 6 + strlen(command));
+	vTaskDelay(100 / portTICK_PERIOD_MS);
+    /* Check timeout */
+    MODEM_CHECK(xSemaphoreTake(esp_dte->process_sem, pdMS_TO_TICKS(timeout)) == pdTRUE, "process command timeout", err);
+    ret = ESP_OK;
+		free(frame);
+err:
+    dce->handle_cmux_frame = NULL;
+    return ret;
+}
+
 /**
  * @brief Send data to DCE
  *
@@ -261,12 +465,53 @@ static int esp_modem_dte_send_data(modem_dte_t *dte, const char *data, uint32_t 
 {
     MODEM_CHECK(data, "data is NULL", err);
     esp_modem_dte_t *esp_dte = __containerof(dte, esp_modem_dte_t, parent);
+		/*printf("> ");
+		for (uint8_t i = 0; i < length; i++)
+			printf("%02x ", data[i]);
+		printf("\n");*/
     return uart_write_bytes(esp_dte->uart_port, data, length);
 err:
     return -1;
 }
 
+/**
+ * @brief Send CMUX data to DCE
+ *
+ * @param dte Modem DTE object
+ * @param data data buffer
+ * @param length length of data to send
+ * @return int actual length of data that has been send out
+ */
+static int esp_modem_dte_send_cmux_data(modem_dte_t *dte, const char *data, uint32_t length)
+{
+    MODEM_CHECK(data, "data is NULL", err);
+    esp_modem_dte_t *esp_dte = __containerof(dte, esp_modem_dte_t, parent);
+		uint32_t length_to_transmit = length;
+		while (length_to_transmit > 0)
+		{
+			uint8_t current_frame_length = length_to_transmit;
+			if (length_to_transmit > 127)
+				current_frame_length = 127;
 
+			char *frame;
+			frame = (char *) malloc(6 + current_frame_length);
+			frame[0] = SOF_MARKER;
+			frame[1] = (0x1 << 2) + 1;
+			frame[2] = FT_UIH;
+			frame[3] = (current_frame_length << 1) + 1;
+			memcpy(&frame[4], &data[length-length_to_transmit], current_frame_length);
+			frame[4 + current_frame_length] = 0xFF - crc8(&frame[1], 3, FCS_POLYNOMIAL, FCS_INIT_VALUE, true);
+			frame[5 + current_frame_length] = SOF_MARKER;
+			/* Calculate timeout clock tick */
+			/* Reset runtime information */
+			uart_write_bytes(esp_dte->uart_port, frame, 6 + current_frame_length);
+			free(frame);
+			length_to_transmit -= current_frame_length;
+		}
+		return length;
+err:
+    return -1;
+}
 
 /**
  * @brief Send data and wait for prompt from DCE
@@ -323,6 +568,7 @@ static esp_err_t esp_modem_dte_change_mode(modem_dte_t *dte, modem_mode_t new_mo
     MODEM_CHECK(dce->mode != new_mode, "already in mode: %d", err, new_mode);
     switch (new_mode) {
     case MODEM_PPP_MODE:
+        ESP_LOGI(MODEM_TAG, "PPP MODE");
         MODEM_CHECK(dce->set_working_mode(dce, new_mode) == ESP_OK, "set new working mode:%d failed", err, new_mode);
         uart_disable_pattern_det_intr(esp_dte->uart_port);
         uart_enable_rx_intr(esp_dte->uart_port);
@@ -331,9 +577,15 @@ static esp_err_t esp_modem_dte_change_mode(modem_dte_t *dte, modem_mode_t new_mo
         uart_disable_rx_intr(esp_dte->uart_port);
         uart_flush(esp_dte->uart_port);
         uart_enable_pattern_det_baud_intr(esp_dte->uart_port, '\n', 1, MIN_PATTERN_INTERVAL, MIN_POST_IDLE, MIN_PRE_IDLE);
-        uart_pattern_queue_reset(esp_dte->uart_port, esp_dte->pattern_queue_size);
+//        uart_pattern_queue_reset(esp_dte->uart_port, esp_dte->pattern_queue_size);
         MODEM_CHECK(dce->set_working_mode(dce, new_mode) == ESP_OK, "set new working mode:%d failed", err, new_mode);
         break;
+    case MODEM_CMUX_MODE:
+        MODEM_CHECK(dce->set_working_mode(dce, new_mode) == ESP_OK, "set new working mode:%d failed", err, new_mode);
+        uart_disable_pattern_det_intr(esp_dte->uart_port);
+        uart_enable_rx_intr(esp_dte->uart_port);
+        dce->setup_cmux(dce);
+         break;
     default:
         break;
     }
@@ -393,11 +645,15 @@ modem_dte_t *esp_modem_dte_init(const esp_modem_dte_config_t *config)
     esp_dte->parent.flow_ctrl = config->flow_control;
     /* Bind methods */
     esp_dte->parent.send_cmd = esp_modem_dte_send_cmd;
+    esp_dte->parent.send_cmux_cmd = esp_modem_dte_send_cmux_cmd;
+    esp_dte->parent.send_sabm = esp_modem_dte_send_sabm;
     esp_dte->parent.send_data = esp_modem_dte_send_data;
+	esp_dte->parent.send_cmux_data = esp_modem_dte_send_cmux_data;
     esp_dte->parent.send_wait = esp_modem_dte_send_wait;
     esp_dte->parent.change_mode = esp_modem_dte_change_mode;
     esp_dte->parent.process_cmd_done = esp_modem_dte_process_cmd_done;
     esp_dte->parent.deinit = esp_modem_dte_deinit;
+    esp_dte->parent.cmux = config->cmux;
 
     /* Config UART */
     uart_config_t uart_config = {
@@ -458,6 +714,9 @@ modem_dte_t *esp_modem_dte_init(const esp_modem_dte_config_t *config)
                                  & (esp_dte->uart_event_task_hdl)   //Task Handler
                                 );
     MODEM_CHECK(ret == pdTRUE, "create uart event task failed", err_tsk_create);
+    uart_write_bytes(esp_dte->uart_port, "+++", 3);
+    char cmd_cld[8] = {0xf9, 0x03, 0xef, 0x05, 0xc3, 0x01, 0xf2, 0xf9};
+    uart_write_bytes(esp_dte->uart_port, cmd_cld, 8);
     return &(esp_dte->parent);
     /* Error handling */
 err_tsk_create:
@@ -504,6 +763,21 @@ esp_err_t esp_modem_start_ppp(modem_dte_t *dte)
     return ESP_OK;
 err:
     return ESP_FAIL;
+}
+
+esp_err_t esp_modem_start_cmux(modem_dte_t *dte) 
+{
+    modem_dce_t *dce = dte->dce;
+    MODEM_CHECK(dce, "DTE has not yet bind with DCE", err);
+    esp_modem_dte_t *esp_dte = __containerof(dte, esp_modem_dte_t, parent);
+
+    /* Enter command mode */
+    MODEM_CHECK(dte->change_mode(dte, MODEM_CMUX_MODE) == ESP_OK, "enter command mode failed", err);
+
+    return ESP_OK;
+err:
+    return ESP_FAIL;
+
 }
 
 esp_err_t esp_modem_stop_ppp(modem_dte_t *dte)

@@ -61,6 +61,7 @@ typedef struct {
     uint32_t event_task_stack_size; /*!< UART Event Task Stack size */
     int event_task_priority;        /*!< UART Event Task Priority */
     int line_buffer_size;           /*!< Line buffer size for command mode */
+    bool cmux;
 } esp_modem_dte_config_t;
 
 /**
@@ -91,7 +92,8 @@ typedef esp_err_t (*esp_modem_on_receive)(void *buffer, size_t len, void *contex
         .event_queue_size = 30,                 \
         .event_task_stack_size = 2048,          \
         .event_task_priority = 5,               \
-        .line_buffer_size = 512                 \
+        .line_buffer_size = 512,                \
+        .cmux = true                            \
     }
 
 /**
@@ -136,6 +138,16 @@ esp_err_t esp_modem_remove_event_handler(modem_dte_t *dte, esp_event_handler_t h
  *      - ESP_FAIL on error
  */
 esp_err_t esp_modem_start_ppp(modem_dte_t *dte);
+
+/**
+ * @brief Start CMUX
+ *
+ * @param dte Modem DTE object
+ * @return esp_err_t
+ *      - ESP_OK on success
+ *      - ESP_FAIL on error
+ */
+esp_err_t esp_modem_start_cmux(modem_dte_t *dte);
 
 /**
  * @brief Exit PPP Session

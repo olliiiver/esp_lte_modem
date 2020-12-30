@@ -30,6 +30,25 @@ static const char *DCE_TAG = "dce_service";
         }                                                                             \
     } while (0)
 
+/**
+ * @brief Handle response from ATD*99#
+ */
+esp_err_t esp_modem_dce_handle_cmux_sabm(modem_dce_t *dce, const char *frame)
+{
+    esp_err_t err = ESP_FAIL;
+    if (frame[2] == (FT_UA | PF))
+    {
+      err = esp_modem_process_command_done(dce, MODEM_STATE_SUCCESS);
+      ESP_LOGD(DCE_TAG, "CMUX SABM success");
+    }
+    else
+    {
+      err = esp_modem_process_command_done(dce, MODEM_STATE_FAIL);
+      ESP_LOGE(DCE_TAG, "CMUX SABM failed");
+    }
+    return err;
+}
+
 esp_err_t esp_modem_dce_handle_response_default(modem_dce_t *dce, const char *line)
 {
     esp_err_t err = ESP_FAIL;
@@ -93,6 +112,23 @@ esp_err_t esp_modem_dce_set_flow_ctrl(modem_dce_t *dce, modem_flow_ctrl_t flow_c
     DCE_CHECK(dte->send_cmd(dte, command, MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
     DCE_CHECK(dce->state == MODEM_STATE_SUCCESS, "set flow control failed", err);
     ESP_LOGD(DCE_TAG, "set flow control ok");
+    return ESP_OK;
+err:
+    return ESP_FAIL;
+}
+
+esp_err_t esp_modem_dce_setup_cmux(modem_dce_t *dce)
+{
+    modem_dte_t *dte = dce->dte;
+    for (uint8_t i = 0; i < 3; i++)
+    {
+      dce->handle_cmux_frame = esp_modem_dce_handle_cmux_sabm;
+      DCE_CHECK(dte->send_sabm(dte, i, MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
+      vTaskDelay(100 / portTICK_PERIOD_MS); // Waiting before open next DLC
+    }
+
+    dte->send_cmd = dte->send_cmux_cmd;
+    dte->send_data = dte->send_cmux_data;
     return ESP_OK;
 err:
     return ESP_FAIL;

@@ -84,6 +84,7 @@ static esp_err_t bg96_handle_exit_data_mode(modem_dce_t *dce, const char *line)
  */
 static esp_err_t bg96_handle_atd_ppp(modem_dce_t *dce, const char *line)
 {
+    ESP_LOGI("DCE_TAG", "ATD response: %s", line);
     esp_err_t err = ESP_FAIL;
     if (strstr(line, MODEM_RESULT_CODE_CONNECT)) {
         err = esp_modem_process_command_done(dce, MODEM_STATE_SUCCESS);
@@ -260,6 +261,21 @@ err:
 }
 
 /**
++ * @brief Handle response from AT+CMUX=0
++ */
+static esp_err_t bg96_handle_at_cmux(modem_dce_t *dce, const char *line)
+{
+    esp_err_t err = ESP_FAIL;
+    if (strstr(line, MODEM_RESULT_CODE_SUCCESS)) {
+        ESP_LOGI(DCE_TAG, "CMUX command success");
+        err = esp_modem_process_command_done(dce, MODEM_STATE_SUCCESS);
+    } else if (strstr(line, MODEM_RESULT_CODE_ERROR)) {
+        err = esp_modem_process_command_done(dce, MODEM_STATE_FAIL);
+    }
+    return err;
+}
+
+/**
  * @brief Set Working Mode
  *
  * @param dce Modem DCE object
@@ -285,6 +301,13 @@ static esp_err_t bg96_set_working_mode(modem_dce_t *dce, modem_mode_t mode)
         DCE_CHECK(dce->state == MODEM_STATE_SUCCESS, "enter ppp mode failed", err);
         ESP_LOGD(DCE_TAG, "enter ppp mode ok");
         dce->mode = MODEM_PPP_MODE;
+        break;
+    case MODEM_CMUX_MODE:
+        dce->handle_line = bg96_handle_at_cmux;
+        DCE_CHECK(dte->send_cmd(dte, "AT+CMUX=0\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
+        DCE_CHECK(dce->state == MODEM_STATE_SUCCESS, "enter CMUX mode failed", err);
+        ESP_LOGI(DCE_TAG, "enter CMUX mode ok");
+        dce->mode = MODEM_CMUX_MODE;
         break;
     default:
         ESP_LOGW(DCE_TAG, "unsupported working mode: %d", mode);
@@ -494,11 +517,20 @@ modem_dce_t *bg96_init(modem_dte_t *dte)
     bg96_dce->parent.get_signal_quality = bg96_get_signal_quality;
     bg96_dce->parent.get_battery_status = bg96_get_battery_status;
     bg96_dce->parent.set_working_mode = bg96_set_working_mode;
+//    esp_dte->parent.change_mode = esp_modem_dte_change_mode;
     bg96_dce->parent.power_down = bg96_power_down;
     bg96_dce->parent.needpin = false;
     bg96_dce->parent.deinit = bg96_deinit;
     /* Sync between DTE and DCE */
     DCE_CHECK(esp_modem_dce_sync(&(bg96_dce->parent)) == ESP_OK, "sync failed", err_io);
+
+    /* CMUX */
+    if (bg96_dce->parent.dte->cmux) {
+        ESP_LOGI(DCE_TAG, "CMUX setup");
+ //         esp_modem_start_cmux(dte); 
+ //       DCE_CHECK(bg96_dce->parent.dte->change_mode(bg96_dce->parent.dte, 2) == ESP_OK, "CMUX failed", err_io);
+    }
+
     /* Close echo */
     DCE_CHECK(esp_modem_dce_echo(&(bg96_dce->parent), false) == ESP_OK, "close echo mode failed", err_io);
     /* Get Module name */
@@ -511,6 +543,8 @@ modem_dce_t *bg96_init(modem_dte_t *dte)
     DCE_CHECK(bg96_get_imsi_number(bg96_dce) == ESP_OK, "get imsi failed", err_io);
     /* Get operator name */
     DCE_CHECK(bg96_get_operator_name(bg96_dce) == ESP_OK, "get operator name failed", err_io);
+
+
     return &(bg96_dce->parent);
 err_io:
     free(bg96_dce);

@@ -116,6 +116,20 @@ static esp_err_t sim800_handle_atd_ppp(modem_dce_t *dce, const char *line)
 }
 
 /**
+ * @brief Handle response from ATD*99#
+ */
+static esp_err_t sim800_handle_at_cmux(modem_dce_t *dce, const char *line)
+{
+    esp_err_t err = ESP_FAIL;
+    if (strstr(line, MODEM_RESULT_CODE_SUCCESS)) {
+        err = esp_modem_process_command_done(dce, MODEM_STATE_SUCCESS);
+    } else if (strstr(line, MODEM_RESULT_CODE_ERROR)) {
+        err = esp_modem_process_command_done(dce, MODEM_STATE_FAIL);
+    }
+    return err;
+}
+
+/**
  * @brief Handle response from AT+CGMM
  */
 static esp_err_t sim800_handle_cgmm(modem_dce_t *dce, const char *line)
@@ -306,6 +320,13 @@ static esp_err_t sim800_set_working_mode(modem_dce_t *dce, modem_mode_t mode)
         ESP_LOGD(DCE_TAG, "enter ppp mode ok");
         dce->mode = MODEM_PPP_MODE;
         break;
+    case MODEM_CMUX_MODE:
+        dce->handle_line = sim800_handle_at_cmux;
+        DCE_CHECK(dte->send_cmd(dte, "AT+CMUX=0\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send command failed", err);
+        DCE_CHECK(dce->state == MODEM_STATE_SUCCESS, "enter CMUX mode failed", err);
+        ESP_LOGD(DCE_TAG, "enter CMUX mode ok");
+        dce->mode = MODEM_CMUX_MODE;
+        break;
     default:
         ESP_LOGW(DCE_TAG, "unsupported working mode: %d", mode);
         goto err;
@@ -456,8 +477,12 @@ modem_dce_t *sim800_init(modem_dte_t *dte)
     sim800_dce->parent.set_working_mode = sim800_set_working_mode;
     sim800_dce->parent.power_down = sim800_power_down;
     sim800_dce->parent.deinit = sim800_deinit;
+    sim800_dce->parent.setup_cmux = esp_modem_dce_setup_cmux;
     /* Sync between DTE and DCE */
     DCE_CHECK(esp_modem_dce_sync(&(sim800_dce->parent)) == ESP_OK, "sync failed", err_io);
+    /* Setup CMUX */
+    if (sim800_dce->parent.dte->cmux)
+      DCE_CHECK(sim800_dce->parent.dte->change_mode(sim800_dce->parent.dte, MODEM_CMUX_MODE) == ESP_OK, "CMUX failed", err_io);
     /* Close echo */
     DCE_CHECK(esp_modem_dce_echo(&(sim800_dce->parent), false) == ESP_OK, "close echo mode failed", err_io);
     /* Get Module name */

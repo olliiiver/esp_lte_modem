@@ -255,6 +255,9 @@ void app_main(void)
     void *modem_netif_adapter = esp_modem_netif_setup(dte);
     esp_modem_netif_set_default_handlers(modem_netif_adapter, esp_netif);
 
+    // Enable CMUX
+    esp_modem_start_cmux(dte);
+
     while (1) {
         modem_dce_t *dce = NULL;
         /* create dce object */
@@ -303,7 +306,7 @@ void app_main(void)
         esp_mqtt_client_destroy(mqtt_client);
 
         /* Exit PPP mode */
-        ESP_ERROR_CHECK(esp_modem_stop_ppp(dte));
+        // ESP_ERROR_CHECK(esp_modem_stop_ppp(dte));
 
         xEventGroupWaitBits(event_group, STOP_BIT, pdTRUE, pdTRUE, portMAX_DELAY);
 #if CONFIG_EXAMPLE_SEND_MSG
