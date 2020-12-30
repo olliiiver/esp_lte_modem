@@ -465,6 +465,7 @@ static esp_err_t bg96_ask_pin(bg96_modem_dce_t *bg96_dce)
         DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "set PIN failed", err);
         ESP_LOGI(DCE_TAG, "set PIN ok");
         bg96_dce->parent.needpin = false;
+        vTaskDelay(1000 / portTICK_PERIOD_MS); /* Wait a sec */
         return ESP_OK;
     }
     DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "set PIN failed", err);

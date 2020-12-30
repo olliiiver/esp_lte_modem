@@ -494,6 +494,7 @@ esp_err_t esp_modem_start_ppp(modem_dte_t *dte)
     MODEM_CHECK(dce, "DTE has not yet bind with DCE", err);
     esp_modem_dte_t *esp_dte = __containerof(dte, esp_modem_dte_t, parent);
     /* Set PDP Context */
+    ESP_LOGI(MODEM_TAG, "APN: %s", CONFIG_COMPONENT_MODEM_APN);
     MODEM_CHECK(dce->define_pdp_context(dce, 1, "IP", CONFIG_COMPONENT_MODEM_APN) == ESP_OK, "set MODEM APN failed", err);
     /* Enter PPP mode */
     MODEM_CHECK(dte->change_mode(dte, MODEM_PPP_MODE) == ESP_OK, "enter ppp mode failed", err);
