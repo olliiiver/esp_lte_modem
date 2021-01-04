@@ -52,6 +52,7 @@ ESP_EVENT_DEFINE_BASE(ESP_MODEM_EVENT);
 typedef struct {
     uart_port_t uart_port;                  /*!< UART port */
     uint8_t *buffer;                        /*!< Internal buffer to store response lines/data from DCE */
+    uint16_t buffer_len;
     QueueHandle_t event_queue;              /*!< UART event queue handle */
     esp_event_loop_handle_t event_loop_hdl; /*!< Event loop handle */
     TaskHandle_t uart_event_task_hdl;       /*!< UART event task handle */
@@ -153,63 +154,56 @@ err:
  *      - ESP_OK on success
  *      - ESP_FAIL on error
  */
-static esp_err_t esp_dte_handle_cmux_frame(esp_modem_dte_t *esp_dte, int32_t buf_length)
+static esp_err_t esp_dte_handle_cmux_frame(esp_modem_dte_t *esp_dte)
 {
     modem_dce_t *dce = esp_dte->parent.dce;
-    MODEM_CHECK(dce, "DTE has not yet bind with DCE", err);
     char *frame = (char *)(esp_dte->buffer);
-    if (buf_length < 5) {
-        ESP_LOGD(MODEM_TAG, "Buffer too small. Buf: %d", buf_length);
-        buf_length += uart_read_bytes(esp_dte->uart_port, (uint8_t *)&frame[buf_length], 6 - buf_length, pdMS_TO_TICKS(100));
-    }
-    while (buf_length > 5)
-    {
-        uint8_t dlci = frame[1] >> 2;
-        uint8_t type = frame[2];
-        uint8_t length = frame[3] >> 1;
-        ESP_LOGI(MODEM_TAG, "CMUX FR: A:%02x T:%02x L:%d Buf:%d", dlci, type, length, buf_length);
-        while (length + 6 > buf_length)
-        {
-            ESP_LOGD(MODEM_TAG, "Frame length %d, buffer %d, reading additional %d", length, buf_length, length + 6 - buf_length);
-            buf_length += uart_read_bytes(esp_dte->uart_port, (uint8_t *)&frame[buf_length], length + 6 - buf_length, pdMS_TO_TICKS(100));
-            ESP_LOGD(MODEM_TAG, "Final buffer %d", buf_length);
-        }
-        if (dce->handle_cmux_frame != NULL)
+
+    MODEM_CHECK(dce, "DTE has not yet bind with DCE", err);
+    uint8_t dlci = frame[1] >> 2;
+    uint8_t type = frame[2];
+    uint8_t length = frame[3] >> 1;
+    
+    ESP_LOGD(MODEM_TAG, "CMUX FR: A:%02x T:%02x L:%d Buf:%d", dlci, type, length, esp_dte->buffer_len);
+//    printf("buffer >>> ");
+//	for (uint16_t i = 0; i < length; i++)
+//	    printf("%02x ", frame[i]);
+//	printf("\n");
+
+    if (dce->handle_cmux_frame != NULL) {
             MODEM_CHECK(dce->handle_cmux_frame(dce, frame) == ESP_OK, "handle cmux frame failed", err_handle);
-        else if (type == 0xFF && dlci == 1 && dce->handle_line != NULL &&
-                 !(dce->mode == MODEM_PPP_MODE) && strlen(&frame[6]) > 2)
+    }
+    else if ((type == FT_UIH || type == (FT_UIH | PF)) && dlci == 1 && dce->handle_line != NULL 
+             && strlen(&frame[6]) > 2)
+    {
+        // Handle CONNECT message on DLCI 1
+        ESP_LOGI(MODEM_TAG, "Handle Line: %s for DLCI 1", &frame[6]);
+        MODEM_CHECK(dce->handle_line, "no handler for line", err_handle);
+        MODEM_CHECK(dce->handle_line(dce, &frame[6]) == ESP_OK, "handle line failed", err_handle);
+        dce->handle_line = NULL;
+    }
+    else if ((type == FT_UIH || type == (FT_UIH | PF)) && dlci == 2 && dce->handle_line != NULL)
+    {
+        ESP_LOGD(MODEM_TAG, "Handle line from DLCI 2");
+        frame[4 + length] = '\0';
+        /* Skipping first two \r\n */
+        if (strlen(&frame[6]) > 2)
         {
-            // Handle CONNECT message on DLCI 1
-            ESP_LOGI(MODEM_TAG, "Line: %s", &frame[6]);
+            ESP_LOGD(MODEM_TAG, "Line: %s", &frame[6]);
             MODEM_CHECK(dce->handle_line, "no handler for line", err_handle);
             MODEM_CHECK(dce->handle_line(dce, &frame[6]) == ESP_OK, "handle line failed", err_handle);
         }
-        else if ((type == FT_UIH || type == 0xFF) && dlci == 2 && dce->handle_line != NULL)
-        {
-            ESP_LOGD(MODEM_TAG, "Handle line from DLCI 2");
-            frame[4 + length] = '\0';
-            /* Skipping first two \r\n */
-            if (strlen(&frame[6]) > 2)
-            {
-                ESP_LOGD(MODEM_TAG, "Line: %s", &frame[6]);
-                MODEM_CHECK(dce->handle_line, "no handler for line", err_handle);
-                MODEM_CHECK(dce->handle_line(dce, &frame[6]) == ESP_OK, "handle line failed", err_handle);
-            }
-        }
-        else if ((type == FT_UIH || type == 0xFF) && length && dlci == 1 && esp_dte->receive_cb != NULL)
-        {
-            // Handle DCI 1
-            ESP_LOGD(MODEM_TAG, "Pass data from DLCI: %d to receive_cb", dlci);
-            esp_dte->receive_cb(&frame[4], length, esp_dte->receive_cb_ctx);
-        }
-        else if (dlci != 0)
-        {
-            ESP_LOGW(MODEM_TAG, "Unknown state...");
-        }
-        frame += length + 6;
-        buf_length -= length + 6;
     }
-
+    else if ((type == FT_UIH || type == (FT_UIH | PF)) && length && dlci == 1 && esp_dte->receive_cb != NULL)
+    {
+        // Handle DCLI 1
+        ESP_LOGD(MODEM_TAG, "Pass data with length %d from DLCI: %d to receive_cb", length, dlci);
+        esp_dte->receive_cb(&esp_dte->buffer[4], length, esp_dte->receive_cb_ctx);
+    }
+    else if (dlci != 0)
+    {
+        ESP_LOGW(MODEM_TAG, "Unknown state...");
+    }
     return ESP_OK;
 
 err_handle:
@@ -254,6 +248,67 @@ static void esp_handle_uart_pattern(esp_modem_dte_t *esp_dte)
     }
 }
 
+static void esp_handle_uart_frame(esp_modem_dte_t *esp_dte)
+{
+    
+    uint16_t fl, frame_length_full;
+
+    handle:
+
+    fl = esp_dte->buffer[3] >> 1;
+    frame_length_full = fl + 6;
+    ESP_LOGD(MODEM_TAG, "Check frame with buffer length: %d, frame length: %d", esp_dte->buffer_len, frame_length_full);
+
+    if (esp_dte->buffer_len < 5) {
+        return; 
+    }
+
+    if (esp_dte->buffer[0] != SOF_MARKER) {
+        ESP_LOGW(MODEM_TAG, "Missing start SOF"); 
+        return; 
+    }
+
+    if (esp_dte->buffer_len < frame_length_full) {
+        // Frame incomplete
+        return;
+    }
+
+    if (esp_dte->buffer[frame_length_full-1] != SOF_MARKER) {
+        ESP_LOGW(MODEM_TAG, "Missing end SOF");
+        return; 
+    }
+    
+    // handle one complete frame
+    esp_dte_handle_cmux_frame(esp_dte);
+
+    // check if there is data from next frame
+    if (esp_dte->buffer_len > frame_length_full)
+    {
+        uint16_t frame_length_next = esp_dte->buffer_len - frame_length_full;
+        ESP_LOGD(MODEM_TAG, "Copy %d from next frame to beginning of the buffer", frame_length_next);
+//        printf("copy >>> ");
+//        for (uint16_t i = 0; i < esp_dte->buffer_len; i++)
+//            printf("%02x ", esp_dte->buffer[i]);
+//        printf("\n");
+
+        memcpy(esp_dte->buffer, &esp_dte->buffer[frame_length_full], frame_length_next);
+        esp_dte->buffer_len = frame_length_next;
+
+//        printf("after copy >>> ");
+//        for (uint16_t i = 0; i < esp_dte->buffer_len; i++)
+//            printf("%02x ", esp_dte->buffer[i]);
+//        printf("\n");
+
+        if (esp_dte->buffer_len > 4)
+            goto handle;
+    }
+    else
+    {
+        // set back to beginning
+        esp_dte->buffer_len = 0;
+    }
+}
+
 /**
  * @brief Handle when new data received by UART
  *
@@ -261,31 +316,30 @@ static void esp_handle_uart_pattern(esp_modem_dte_t *esp_dte)
  */
 static void esp_handle_uart_data(esp_modem_dte_t *esp_dte)
 {
-//    if (esp_dte->parent.dce->mode != MODEM_PPP_MODE
-//    || esp_dte->parent.dce->mode == MODEM_CMUX_MODE
-//    ) {
-//        ESP_LOGE(MODEM_TAG, "Error: Got data event in PPP mode");
-//        /* pattern detection mode -> ignore date event on uart
-//         * (should never happen, but if it does, we could still
-//         * read the valid data once pattern detect event fired) */
-//        return;
-//    }
     size_t length = 0;
-    uart_get_buffered_data_len(esp_dte->uart_port, &length);
     length = MIN(esp_dte->line_buffer_size, length);
-    length = uart_read_bytes(esp_dte->uart_port, esp_dte->buffer, length, portMAX_DELAY);
-    /* pass the input data to configured callback */
-    if (length) {
-				// printf("received < ");
-				// for (uint8_t i = 0; i < length; i++)
-				//	printf("%02x ", esp_dte->buffer[i]);
-				// printf("\n");
+    uart_get_buffered_data_len(esp_dte->uart_port, &length);
+    length = uart_read_bytes(esp_dte->uart_port, &esp_dte->buffer[esp_dte->buffer_len], length, portMAX_DELAY);
+    esp_dte->buffer_len += length;
+//        printf("received < ");
+//	    for (uint16_t i = 0; i < length; i++)
+//	        printf("%02x ", buffer[i]);
+//	    printf("\n");
+
+    if (esp_dte->buffer_len > 0)
+    {
         if (esp_dte->buffer[0] == SOF_MARKER)
         {
-          esp_dte_handle_cmux_frame(esp_dte, length);
-          return;
+            esp_handle_uart_frame(esp_dte);
         }
-        esp_dte->receive_cb(esp_dte->buffer, length, esp_dte->receive_cb_ctx);
+        else
+        {
+//            ESP_LOGW(MODEM_TAG, "RX data is out of sync. Missing SOF. Buffer length: %d", esp_dte->buffer_len);
+//            memcpy(esp_dte->buffer, &esp_dte->buffer[1], esp_dte->buffer_len - 1);
+//            esp_dte->buffer_len--;
+//            vTaskDelay(100 / portTICK_PERIOD_MS);
+//            goto handle;
+        }
     }
 }
 
@@ -486,29 +540,30 @@ static int esp_modem_dte_send_cmux_data(modem_dte_t *dte, const char *data, uint
 {
     MODEM_CHECK(data, "data is NULL", err);
     esp_modem_dte_t *esp_dte = __containerof(dte, esp_modem_dte_t, parent);
-		uint32_t length_to_transmit = length;
-		while (length_to_transmit > 0)
-		{
-			uint8_t current_frame_length = length_to_transmit;
-			if (length_to_transmit > 127)
-				current_frame_length = 127;
+    uint32_t length_to_transmit = length;
+    while (length_to_transmit > 0)
+    {
+        uint8_t current_frame_length = length_to_transmit;
+        if (length_to_transmit > 127)
+            current_frame_length = 127;
 
-			char *frame;
-			frame = (char *) malloc(6 + current_frame_length);
-			frame[0] = SOF_MARKER;
-			frame[1] = (0x1 << 2) + 1;
-			frame[2] = FT_UIH;
-			frame[3] = (current_frame_length << 1) + 1;
-			memcpy(&frame[4], &data[length-length_to_transmit], current_frame_length);
-			frame[4 + current_frame_length] = 0xFF - crc8(&frame[1], 3, FCS_POLYNOMIAL, FCS_INIT_VALUE, true);
-			frame[5 + current_frame_length] = SOF_MARKER;
-			/* Calculate timeout clock tick */
-			/* Reset runtime information */
-			uart_write_bytes(esp_dte->uart_port, frame, 6 + current_frame_length);
-			free(frame);
-			length_to_transmit -= current_frame_length;
-		}
-		return length;
+        char *frame;
+        frame = (char *)malloc(6 + current_frame_length);
+        frame[0] = SOF_MARKER;
+        frame[1] = (0x1 << 2) + 1;
+        frame[2] = FT_UIH;
+        frame[3] = (current_frame_length << 1) + 1;
+        memcpy(&frame[4], &data[length - length_to_transmit], current_frame_length);
+        frame[4 + current_frame_length] = 0xFF - crc8(&frame[1], 3, FCS_POLYNOMIAL, FCS_INIT_VALUE, true);
+        frame[5 + current_frame_length] = SOF_MARKER;
+        /* Calculate timeout clock tick */
+        /* Reset runtime information */
+        uart_write_bytes(esp_dte->uart_port, frame, 6 + current_frame_length);
+        ESP_LOGD(MODEM_TAG, ">>>> Send %d", current_frame_length);
+        free(frame);
+        length_to_transmit -= current_frame_length;
+    }
+    return length;
 err:
     return -1;
 }
@@ -640,6 +695,9 @@ modem_dte_t *esp_modem_dte_init(const esp_modem_dte_config_t *config)
     esp_dte->line_buffer_size = config->line_buffer_size;
     esp_dte->buffer = calloc(1, config->line_buffer_size);
     MODEM_CHECK(esp_dte->buffer, "calloc line memory failed", err_line_mem);
+
+    esp_dte->buffer_len = 0;
+
     /* Set attributes */
     esp_dte->uart_port = config->port_num;
     esp_dte->parent.flow_ctrl = config->flow_control;
@@ -769,15 +827,13 @@ esp_err_t esp_modem_start_cmux(modem_dte_t *dte)
 {
     modem_dce_t *dce = dte->dce;
     MODEM_CHECK(dce, "DTE has not yet bind with DCE", err);
-    esp_modem_dte_t *esp_dte = __containerof(dte, esp_modem_dte_t, parent);
 
-    /* Enter command mode */
+    /* Enter cmux mode */
     MODEM_CHECK(dte->change_mode(dte, MODEM_CMUX_MODE) == ESP_OK, "enter command mode failed", err);
 
     return ESP_OK;
 err:
     return ESP_FAIL;
-
 }
 
 esp_err_t esp_modem_stop_ppp(modem_dte_t *dte)
