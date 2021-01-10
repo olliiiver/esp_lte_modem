@@ -481,8 +481,8 @@ modem_dce_t *sim800_init(modem_dte_t *dte)
     /* Sync between DTE and DCE */
     DCE_CHECK(esp_modem_dce_sync(&(sim800_dce->parent)) == ESP_OK, "sync failed", err_io);
     /* Setup CMUX */
-    if (sim800_dce->parent.dte->cmux)
-      DCE_CHECK(sim800_dce->parent.dte->change_mode(sim800_dce->parent.dte, MODEM_CMUX_MODE) == ESP_OK, "CMUX failed", err_io);
+ //   if (sim800_dce->parent.dte->cmux)
+ //     DCE_CHECK(sim800_dce->parent.dte->change_mode(sim800_dce->parent.dte, MODEM_CMUX_MODE) == ESP_OK, "CMUX failed", err_io);
     /* Close echo */
     DCE_CHECK(esp_modem_dce_echo(&(sim800_dce->parent), false) == ESP_OK, "close echo mode failed", err_io);
     /* Get Module name */

@@ -19,7 +19,7 @@
 #include "bg96.h"
 #include "sim7600.h"
 
-#define BROKER_URL "mqtt://mqtt.eclipse.org"
+#define BROKER_URL "mqtt://test.mosquitto.org"
 
 static const char *TAG = "pppos_example";
 static EventGroupHandle_t event_group = NULL;
@@ -241,7 +241,7 @@ void app_main(void)
     config.event_queue_size = CONFIG_EXAMPLE_MODEM_UART_EVENT_QUEUE_SIZE;
     config.event_task_stack_size = CONFIG_EXAMPLE_MODEM_UART_EVENT_TASK_STACK_SIZE;
     config.event_task_priority = CONFIG_EXAMPLE_MODEM_UART_EVENT_TASK_PRIORITY;
-    config.line_buffer_size = CONFIG_EXAMPLE_MODEM_UART_RX_BUFFER_SIZE / 2;
+    config.line_buffer_size = CONFIG_EXAMPLE_MODEM_UART_RX_BUFFER_SIZE * 2;
 
     modem_dte_t *dte = esp_modem_dte_init(&config);
     /* Register event handler */
@@ -255,22 +255,29 @@ void app_main(void)
     void *modem_netif_adapter = esp_modem_netif_setup(dte);
     esp_modem_netif_set_default_handlers(modem_netif_adapter, esp_netif);
 
-    // Enable CMUX
-    esp_modem_start_cmux(dte);
+    modem_dce_t *dce = NULL;
 
-    while (1) {
-        modem_dce_t *dce = NULL;
+    do {
+        ESP_LOGI(TAG, "Trying to initialize modem on GPIO TX: %d / RX: %d", config.tx_io_num, config.rx_io_num);
+        
         /* create dce object */
-#if CONFIG_EXAMPLE_MODEM_DEVICE_SIM800
-        dce = sim800_init(dte);
-#elif CONFIG_EXAMPLE_MODEM_DEVICE_BG96
-        dce = bg96_init(dte);
-#elif CONFIG_EXAMPLE_MODEM_DEVICE_SIM7600
-        dce = sim7600_init(dte);
-#else
-#error "Unsupported DCE"
-#endif
-        assert(dce != NULL);
+        #if CONFIG_EXAMPLE_MODEM_DEVICE_SIM800
+            dce = sim800_init(dte);
+        #elif CONFIG_EXAMPLE_MODEM_DEVICE_BG96
+            dce = bg96_init(dte);
+        #elif CONFIG_EXAMPLE_MODEM_DEVICE_SIM7600
+            dce = sim7600_init(dte);
+        #else
+            #error "Unsupported DCE"
+        #endif
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    } while (dce == NULL);
+    
+    assert(dce != NULL);
+    
+    /* Enable CMUX */
+    esp_modem_start_cmux(dte);
+    
         ESP_ERROR_CHECK(dce->set_flow_ctrl(dce, MODEM_FLOW_CONTROL_NONE));
         ESP_ERROR_CHECK(dce->store_profile(dce));
         /* Print Module ID, Operator, IMEI, IMSI */
@@ -307,21 +314,24 @@ void app_main(void)
 
         /* Exit PPP mode */
         // ESP_ERROR_CHECK(esp_modem_stop_ppp(dte));
-
-        xEventGroupWaitBits(event_group, STOP_BIT, pdTRUE, pdTRUE, portMAX_DELAY);
+        // xEventGroupWaitBits(event_group, STOP_BIT, pdTRUE, pdTRUE, portMAX_DELAY);
 #if CONFIG_EXAMPLE_SEND_MSG
         const char *message = "Welcome to ESP32!";
         ESP_ERROR_CHECK(example_send_message_text(dce, CONFIG_EXAMPLE_SEND_MSG_PEER_PHONE_NUMBER, message));
         ESP_LOGI(TAG, "Send send message [%s] ok", message);
 #endif
-        /* Power down module */
-        ESP_ERROR_CHECK(dce->power_down(dce));
-        ESP_LOGI(TAG, "Power down");
-        ESP_ERROR_CHECK(dce->deinit(dce));
 
-        ESP_LOGI(TAG, "Restart after 60 seconds");
-        vTaskDelay(pdMS_TO_TICKS(60000));
+    while (1) {
+        /* Get signal quality again */
+        ESP_ERROR_CHECK(dce->get_signal_quality(dce, &rssi, &ber));
+        ESP_LOGI(TAG, "rssi: %d, ber: %d", rssi, ber);
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
+
+    /* Power down module */
+    ESP_ERROR_CHECK(dce->power_down(dce));
+    ESP_LOGI(TAG, "Power down");
+    ESP_ERROR_CHECK(dce->deinit(dce));
 
     /* Unregister events, destroy the netif adapter and destroy its esp-netif instance */
     esp_modem_netif_clear_default_handlers(modem_netif_adapter);

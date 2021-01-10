@@ -16,8 +16,13 @@
 #include "esp_log.h"
 #include "bg96.h"
 #include "bg96_private.h"
+#include "sdkconfig.h"
 
 #define MODEM_RESULT_CODE_POWERDOWN "POWERED DOWN"
+
+#ifdef CONFIG_COMPONENT_MODEM_PIN
+    #define MODEM_AT_CPIN  "AT+CPIN=" CONFIG_COMPONENT_MODEM_PIN "\r"
+#endif 
 
 static const char *DCE_TAG = "bg96";
 
@@ -439,6 +444,7 @@ static esp_err_t bg96_deinit(modem_dce_t *dce)
     return ESP_OK;
 }
 
+#ifdef MODEM_AT_CPIN
 /**
  * @brief Handle response from AT+CPIN=XXXX
  */
@@ -450,6 +456,7 @@ static esp_err_t bg96_handle_pin(modem_dce_t *dce, const char *line)
     } 
     return err;
 }
+#endif
 
 /**
  * @brief Handle response from AT+CPIN?
@@ -468,6 +475,7 @@ static esp_err_t bg96_handle_ask_pin(modem_dce_t *dce, const char *line)
     return err;
 }
 
+
 /**
  * @brief Set PIN
  *
@@ -482,14 +490,20 @@ static esp_err_t bg96_ask_pin(bg96_modem_dce_t *bg96_dce)
     bg96_dce->parent.handle_line = bg96_handle_ask_pin;
     DCE_CHECK(dte->send_cmd(dte, "AT+CPIN?\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send CPIN command failed", err);
     if (bg96_dce->parent.needpin) {
-        ESP_LOGI(DCE_TAG, "submit PIN");
-        bg96_dce->parent.handle_line = bg96_handle_pin;
-        DCE_CHECK(dte->send_cmd(dte, "AT+CPIN=4097\r", MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send CPIN command failed", err);
-        DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "set PIN failed", err);
-        ESP_LOGI(DCE_TAG, "set PIN ok");
-        bg96_dce->parent.needpin = false;
-        vTaskDelay(1000 / portTICK_PERIOD_MS); /* Wait a sec */
-        return ESP_OK;
+        #ifdef MODEM_AT_CPIN
+            ESP_LOGI(DCE_TAG, "submit PIN");
+            bg96_dce->parent.handle_line = bg96_handle_pin;
+            DCE_CHECK(dte->send_cmd(dte, MODEM_AT_CPIN, MODEM_COMMAND_TIMEOUT_DEFAULT) == ESP_OK, "send CPIN command failed", err);
+            DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "set PIN failed", err);
+            ESP_LOGI(DCE_TAG, "set PIN ok");
+            bg96_dce->parent.needpin = false;
+            vTaskDelay(1000 / portTICK_PERIOD_MS); /* Wait a sec */
+            return ESP_OK;
+        #else
+            ESP_LOGW(DCE_TAG, "PIN has been requested by DCE, but COMPONENT_MODEM_PIN is not set.");
+            bg96_dce->parent.state = MODEM_STATE_FAIL;
+            return ESP_FAIL;
+        #endif
     }
     DCE_CHECK(bg96_dce->parent.state == MODEM_STATE_SUCCESS, "set PIN failed", err);
     return ESP_OK;
